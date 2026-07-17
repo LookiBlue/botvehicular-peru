@@ -42,16 +42,23 @@ function formatearReporte(placa, sat, apeseg, mtc, sunarp, sutran, scoreData, cr
     vehiculoSection = '⚠️ No disponible';
   } else {
     const lineas = [];
-    if (sunarp.propietario && sunarp.propietario !== 'No disponible') lineas.push(`👤 Propietario: ${sunarp.propietario}`);
-    if (sunarp.num_titulares) lineas.push(`🔄 Dueños anteriores: ${sunarp.num_titulares}`);
-    if (sunarp.marca !== 'No disponible') lineas.push(`🚗 ${[sunarp.marca, sunarp.modelo].filter(Boolean).join(' ')}`);
-    if (sunarp.ano_fabricacion !== 'No disponible') lineas.push(`📅 Año: ${sunarp.ano_fabricacion}`);
-    if (sunarp.color !== 'No disponible') lineas.push(`🎨 Color: ${sunarp.color}`);
-    if (sunarp.clase !== 'No disponible') lineas.push(`📋 Clase: ${sunarp.clase}`);
-    if (sunarp.motor !== 'No disponible') lineas.push(`⚙️ Motor: ${sunarp.motor}`);
-    lineas.push(sunarp.tiene_gravamen ? '🔒 Tiene GRAVAMEN/PRENDA activa' : '✅ Sin gravámenes');
-    lineas.push(sunarp.tiene_embargo ? '⛔ Tiene EMBARGO activo' : '✅ Sin embargos');
-    if (sunarp.estado !== 'No disponible') lineas.push(`📌 Estado: ${sunarp.estado}`);
+    // Propietarios (nuevo formato: array)
+    if (sunarp.propietarios && sunarp.propietarios.length > 0) {
+      lineas.push(`👤 Propietario: ${sunarp.propietarios[0]}`);
+      if (sunarp.propietarios.length > 1) {
+        lineas.push(`🔄 Titulares anteriores: ${sunarp.propietarios.length - 1}`);
+      }
+    }
+    // Datos del vehículo (nuevo formato: objeto vehiculo)
+    const v = sunarp.vehiculo || {};
+    if (v.marca && v.marca !== 'N/D') lineas.push(`🚗 ${[v.marca, v.modelo].filter(x => x && x !== 'N/D').join(' ')}`);
+    if (v.color && v.color !== 'N/D') lineas.push(`🎨 Color: ${v.color}`);
+    if (v.motor && v.motor !== 'N/D') lineas.push(`⚙️ Motor: ${v.motor}`);
+    if (v.vin && v.vin !== 'N/D') lineas.push(`🔢 VIN/Serie: ${v.vin}`);
+    if (v.estado && v.estado !== 'N/D') lineas.push(`📌 Estado: ${v.estado}`);
+    if (v.anotaciones && v.anotaciones !== 'Ninguna') lineas.push(`📄 Anotaciones: ${v.anotaciones}`);
+    if (v.robo && v.robo !== 'No registra') lineas.push(`🚨 ALERTA ROBO: ${v.robo}`);
+    if (sunarp.sede && sunarp.sede !== 'N/D') lineas.push(`🏛️ Sede SUNARP: ${sunarp.sede}`);
     vehiculoSection = lineas.length > 0 ? lineas.join('\n   ') : '⚠️ Sin datos disponibles';
   }
 
@@ -263,7 +270,7 @@ async function handleConsulta(chatId, user, placaRaw, telegramId) {
     consultarSUTRAN(placa),
   ]);
 
-  const scoreData = calcularScore(sat, apeseg, mtc);
+  const scoreData = calcularScore(sat, apeseg, mtc, sutran, sunarp);
 
   // Descontar crédito y guardar caché
   try { await deductCredit(telegramId); } catch (_) {}

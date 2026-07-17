@@ -3,7 +3,8 @@
   "regions": ["gru1"],
   "functions": {
     "api/webhook.js": {
-      "maxDuration": 30
+      "maxDuration": 60,
+      "memory": 512
     }
   },
   "routes": [
