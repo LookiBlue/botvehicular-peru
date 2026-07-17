@@ -9,9 +9,19 @@ const { consultarAPESEG } = require('../lib/scrapers/apeseg');
 const { consultarMTC }    = require('../lib/scrapers/mtc');
 const { calcularScore }   = require('../lib/score');
 
+// Regex para detectar placa peruana válida en texto libre
+const PLACA_REGEX = /^[A-Za-z]{3}[-]?\d{3}$|^[A-Za-z]{2}[-]?\d{4}$/;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // FORMATEADOR DEL REPORTE
 // ─────────────────────────────────────────────────────────────────────────────
+
+function clasificarNivel(score) {
+  if (score >= 80) return { emoji: '🟢', texto: 'BAJO RIESGO' };
+  if (score >= 55) return { emoji: '🟡', texto: 'RIESGO MODERADO' };
+  if (score >= 30) return { emoji: '🟠', texto: 'ALTO RIESGO' };
+  return { emoji: '🔴', texto: 'MUY ALTO RIESGO' };
+}
 
 function formatearReporte(placa, sat, apeseg, mtc, scoreData, creditosRestantes) {
   const fecha = new Date().toLocaleDateString('es-PE', {
@@ -20,61 +30,79 @@ function formatearReporte(placa, sat, apeseg, mtc, scoreData, creditosRestantes)
     timeZone: 'America/Lima',
   });
 
-  const barraLlena  = Math.round(scoreData.score / 10);
-  const barraVacia  = 10 - barraLlena;
-  const barraVisual = '[' + '#'.repeat(barraLlena) + '-'.repeat(barraVacia) + ']';
+  const nivel  = scoreData.nivel;
+  const llenas = Math.round(scoreData.score / 10);
+  const vacias = 10 - llenas;
+  const barra  = '🟩'.repeat(llenas) + '⬜'.repeat(vacias);
 
-  let satSeccion;
+  // ── Sección SAT ─────────────────────────────────────────────────────────
+  let satText;
   if (sat?.error) {
-    satSeccion = 'Servicio no disponible';
+    satText = '⚠️ Servicio no disponible';
+  } else if (sat.multas_impagas > 0) {
+    satText = `🚨 ${sat.multas_impagas} multa(s) — Deuda: S/. ${Number(sat.deuda_total).toFixed(2)}`;
+    if (sat.detalle_multas?.length > 0) {
+      sat.detalle_multas.slice(0, 3).forEach(m => {
+        satText += `\n     • ${m.descripcion || m.numero} S/. ${m.monto}`;
+      });
+    }
   } else {
-    satSeccion = sat.multas_impagas > 0
-      ? `${sat.multas_impagas} multa(s) impaga(s) | Deuda: S/. ${Number(sat.deuda_total).toFixed(2)}`
-      : 'Sin multas pendientes';
+    satText = '✅ Sin multas pendientes';
   }
 
-  let apesegSeccion;
+  // ── Sección APESEG ───────────────────────────────────────────────────────
+  let apesegText;
   if (apeseg?.error || apeseg?.soat_vigente === null) {
-    apesegSeccion = 'Servicio no disponible';
+    apesegText = '⚠️ Servicio no disponible';
   } else if (apeseg.soat_vigente) {
     const vence = apeseg.fecha_vencimiento
-      ? new Date(apeseg.fecha_vencimiento).toLocaleDateString('es-PE')
+      ? new Date(apeseg.fecha_vencimiento).toLocaleDateString('es-PE', { day: '2-digit', month: '2-digit', year: 'numeric' })
       : 'N/D';
-    apesegSeccion = `SOAT Vigente | Aseguradora: ${apeseg.aseguradora} | Vence: ${vence}`;
+    apesegText = `✅ SOAT Vigente\n     Aseguradora: ${apeseg.aseguradora}\n     Vence: ${vence}`;
   } else {
-    apesegSeccion = 'Sin SOAT vigente';
+    apesegText = '❌ Sin SOAT vigente';
   }
 
-  let mtcSeccion;
+  // ── Sección MTC ──────────────────────────────────────────────────────────
+  let mtcText;
   if (mtc?.error) {
-    mtcSeccion = 'Servicio no disponible';
+    mtcText = '⚠️ Servicio no disponible';
   } else {
     const lineas = [];
-    if (mtc.propietario && mtc.propietario !== 'No disponible') lineas.push(`Propietario: ${mtc.propietario}`);
-    if (mtc.marca && mtc.marca !== 'No disponible') lineas.push(`${mtc.marca} ${mtc.modelo} ${mtc.ano}`);
-    lineas.push(mtc.reportado_robado ? 'REPORTADO COMO ROBADO' : 'Sin reporte de robo');
-    lineas.push(mtc.revision_tecnica_vencida ? 'Revision tecnica VENCIDA' : 'Revision tecnica vigente');
-    if (mtc.papeletas_pendientes > 0) lineas.push(`${mtc.papeletas_pendientes} papeleta(s) pendiente(s)`);
-    mtcSeccion = lineas.join(' | ');
+    if (mtc.propietario && mtc.propietario !== 'No disponible') lineas.push(`👤 ${mtc.propietario}`);
+    if (mtc.marca && mtc.marca !== 'No disponible') {
+      lineas.push(`🚗 ${[mtc.marca, mtc.modelo, mtc.ano].filter(x => x && x !== 'No disponible').join(' ')}`);
+    }
+    if (mtc.color && mtc.color !== 'No disponible') lineas.push(`🎨 ${mtc.color}`);
+    lineas.push(mtc.reportado_robado ? '🚨 REPORTADO COMO ROBADO' : '✅ Sin reporte de robo');
+    lineas.push(mtc.revision_tecnica_vencida ? '❌ Revisión técnica VENCIDA' : '✅ Revisión técnica vigente');
+    if (mtc.papeletas_pendientes > 0) lineas.push(`🚨 ${mtc.papeletas_pendientes} papeleta(s) pendiente(s)`);
+    mtcText = lineas.join('\n     ');
   }
 
-  const nivel = scoreData.nivel;
+  // ── Penalizaciones ────────────────────────────────────────────────────────
+  const penActivas = scoreData.penalizaciones.filter(p => p.puntos < 0);
+  const penText = penActivas.length > 0
+    ? '\n⚠️ Penalizaciones:\n' + penActivas.map(p => `   ${p.motivo} (${p.puntos} pts)`).join('\n') + '\n'
+    : '';
 
-  return `REPORTE VEHICULAR
-========================
-Placa: ${placa.toUpperCase()}
-Score de Riesgo: ${scoreData.score}/100 ${nivel.emoji} ${nivel.texto}
-${barraVisual}
+  return `🚗 REPORTE VEHICULAR — Placa: ${placa.toUpperCase()}
+━━━━━━━━━━━━━━━━━━━━━━━
+🎯 Score de Riesgo: ${scoreData.score}/100 ${nivel.emoji} ${nivel.texto}
+${barra}
+${penText}
+━━━━━━━━━━━━━━━━━━━━━━━
+🏛️ SAT LIMA (Multas Adm.)
+   ${satText}
 
-SAT LIMA: ${satSeccion}
+🛡️ APESEG (SOAT)
+   ${apesegText}
 
-APESEG / SOAT: ${apesegSeccion}
-
-MTC / SUNARP: ${mtcSeccion}
-
-========================
-Consulta: ${fecha} (Lima)
-Creditos restantes: ${creditosRestantes}`;
+📋 MTC / SUNARP
+   ${mtcText}
+━━━━━━━━━━━━━━━━━━━━━━━
+🕐 ${fecha} (Lima)
+💳 Créditos restantes: ${creditosRestantes}`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -84,37 +112,48 @@ Creditos restantes: ${creditosRestantes}`;
 async function handleStart(chatId, user, telegramUser) {
   const nombre = telegramUser.first_name || 'amigo';
   await sendMessage(chatId,
-    `Bienvenido al Bot Vehicular Peru, ${nombre}!\n\n` +
+    `🚗 Bienvenido al Bot Vehicular Perú, ${nombre}!\n\n` +
     `Tienes ${user.credits} consultas gratuitas para comenzar.\n\n` +
-    `Como consultar: /consulta ABC-123\n\n` +
+    `¿Cómo consultar?\n` +
+    `/consulta ABC-123\n` +
+    `O simplemente escribe la placa: ABC123\n\n` +
     `Comandos disponibles:\n` +
-    `/consulta [PLACA] - Consultar un vehiculo\n` +
-    `/creditos - Ver tus creditos\n` +
-    `/ayuda - Instrucciones`
+    `/consulta [PLACA] — Consultar un vehículo\n` +
+    `/creditos — Ver tus créditos\n` +
+    `/ayuda — Instrucciones\n\n` +
+    `El reporte incluye: SAT Lima, SOAT, MTC/SUNARP y Score de Riesgo 🎯`
   );
 }
 
 async function handleCreditos(chatId, user) {
   await sendMessage(chatId,
-    `Tus Creditos\n\nTienes ${user.credits} consulta(s) disponible(s).\n\nCada consulta de placa consume 1 credito.`
+    `💳 Tus Créditos\n\n` +
+    `Tienes ${user.credits} consulta(s) disponible(s).\n` +
+    `Cada consulta de placa consume 1 crédito.\n` +
+    `Los resultados se guardan en caché 24 horas.`
   );
 }
 
 async function handleAyuda(chatId) {
   await sendMessage(chatId,
-    `Ayuda - Bot Vehicular Peru\n\n` +
-    `Como hacer una consulta:\n` +
+    `📖 Ayuda — Bot Vehicular Perú\n\n` +
+    `Cómo hacer una consulta:\n` +
     `/consulta ABC-123\n` +
-    `/consulta ABC123\n\n` +
-    `El bot acepta placas con o sin guion.\n\n` +
-    `Que datos obtienes:\n` +
-    `- Multas impagas (SAT Lima)\n` +
-    `- Estado del SOAT (APESEG)\n` +
-    `- Papeletas MTC\n` +
-    `- Datos del propietario (SUNARP)\n` +
-    `- Revision tecnica\n` +
-    `- Score de Riesgo (0-100)\n\n` +
-    `Los resultados se guardan 24 horas en cache.`
+    `/consulta ABC123\n` +
+    `O escribe la placa directamente.\n\n` +
+    `Qué datos obtienes:\n` +
+    `🏛️ Multas administrativas (SAT Lima)\n` +
+    `🛡️ Estado del SOAT (APESEG)\n` +
+    `📋 Papeletas de tránsito (MTC)\n` +
+    `🚨 Reporte de robo (SUNARP/PNP)\n` +
+    `🔧 Revisión técnica (MTC)\n` +
+    `🎯 Score de Riesgo Vehicular (0-100)\n\n` +
+    `Interpretación del Score:\n` +
+    `🟢 80-100: Bajo Riesgo\n` +
+    `🟡 55-79: Riesgo Moderado\n` +
+    `🟠 30-54: Alto Riesgo\n` +
+    `🔴 0-29: Muy Alto Riesgo\n\n` +
+    `Los resultados se guardan 24h en caché.`
   );
 }
 
@@ -123,31 +162,48 @@ async function handleConsulta(chatId, user, placaRaw, telegramId) {
 
   if (!/^[A-Z]{3}\d{3}$/.test(placa) && !/^[A-Z]{2}\d{4}$/.test(placa)) {
     return sendMessage(chatId,
-      'Formato de placa invalido.\nEjemplos validos:\n/consulta ABC-123\n/consulta AB1234'
+      '❌ Formato de placa inválido.\n\n' +
+      'Ejemplos válidos:\n' +
+      '/consulta ABC-123\n' +
+      '/consulta AB1234'
     );
   }
 
-  const cached = await getCachedVehicle(placa);
-  if (cached) {
-    return sendMessage(chatId,
-      formatearReporte(
-        placa,
-        cached.data_json.sat,
-        cached.data_json.apeseg,
-        cached.data_json.mtc,
-        { score: cached.score, nivel: clasificarNivel(cached.score), penalizaciones: cached.data_json.penalizaciones || [] },
-        user.credits
-      ) + '\n\n(Resultado desde cache - menos de 24h)'
-    );
-  }
+  // Verificar caché primero
+  try {
+    const cached = await getCachedVehicle(placa);
+    if (cached) {
+      return sendMessage(chatId,
+        formatearReporte(
+          placa,
+          cached.data_json.sat,
+          cached.data_json.apeseg,
+          cached.data_json.mtc,
+          { score: cached.score, nivel: clasificarNivel(cached.score), penalizaciones: cached.data_json.penalizaciones || [] },
+          user.credits
+        ) + '\n\n📦 Resultado desde caché (menos de 24h)'
+      );
+    }
+  } catch (_) { /* continuar si falla el caché */ }
 
   if (user.credits <= 0) {
-    return sendMessage(chatId, 'Sin creditos disponibles. Actualmente no tienes consultas disponibles.');
+    return sendMessage(chatId,
+      '❌ Sin créditos disponibles.\n\nActualmente no tienes consultas disponibles.'
+    );
   }
 
+  // Notificar que está procesando
   await sendTyping(chatId);
-  await sendMessage(chatId, `Consultando ${placa} en bases de datos...\nSAT Lima, APESEG y MTC/SUNARP\nEsto toma unos segundos...`);
+  await sendMessage(chatId,
+    `🔍 Consultando ${placa}...\n\n` +
+    `Accediendo a:\n` +
+    `• 🏛️ SAT Lima\n` +
+    `• 🛡️ APESEG\n` +
+    `• 📋 MTC / SUNARP\n\n` +
+    `Esto toma unos segundos...`
+  );
 
+  // Consultar las 3 fuentes en paralelo
   const [sat, apeseg, mtc] = await Promise.all([
     consultarSAT(placa),
     consultarAPESEG(placa),
@@ -156,19 +212,13 @@ async function handleConsulta(chatId, user, placaRaw, telegramId) {
 
   const scoreData = calcularScore(sat, apeseg, mtc);
 
-  await deductCredit(telegramId);
-  const creditosRestantes = user.credits - 1;
+  // Descontar crédito y guardar en caché
+  try { await deductCredit(telegramId); } catch (_) {}
+  const creditosRestantes = Math.max(0, user.credits - 1);
 
-  await saveVehicleCache(placa, { sat, apeseg, mtc, penalizaciones: scoreData.penalizaciones }, scoreData.score);
+  try { await saveVehicleCache(placa, { sat, apeseg, mtc, penalizaciones: scoreData.penalizaciones }, scoreData.score); } catch (_) {}
 
   await sendMessage(chatId, formatearReporte(placa, sat, apeseg, mtc, scoreData, creditosRestantes));
-}
-
-function clasificarNivel(score) {
-  if (score >= 80) return { emoji: '(V)', texto: 'BAJO RIESGO' };
-  if (score >= 55) return { emoji: '(!)', texto: 'RIESGO MODERADO' };
-  if (score >= 30) return { emoji: '(!!)', texto: 'ALTO RIESGO' };
-  return { emoji: '(X)', texto: 'MUY ALTO RIESGO' };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -183,7 +233,7 @@ module.exports = async function handler(req, res) {
   // Verificar token secreto del webhook
   const webhookSecret = req.headers['x-telegram-bot-api-secret-token'];
   if (process.env.WEBHOOK_SECRET && webhookSecret !== process.env.WEBHOOK_SECRET) {
-    console.error('[Webhook] Token secreto invalido recibido');
+    console.error('[Webhook] Token secreto inválido recibido');
     return res.status(200).json({ ok: true });
   }
 
@@ -201,16 +251,14 @@ module.exports = async function handler(req, res) {
     const telegramId = message.from.id;
     const text       = message.text.trim();
 
-    console.log(`[Webhook] Mensaje de ${telegramId}: ${text}`);
+    console.log(`[Webhook] Msg de ${telegramId}: ${text}`);
 
     // Obtener usuario con fallback si Supabase falla
     let user = { credits: 5, telegram_id: telegramId };
     try {
       user = await getOrCreateUser(telegramId, message.from.username);
-      console.log(`[Webhook] Usuario cargado: credits=${user.credits}`);
     } catch (dbErr) {
       console.error('[Supabase] Error al obtener usuario:', dbErr.message);
-      // Continuar con usuario temporal para que /start y /ayuda funcionen igual
     }
 
     // Router de comandos
@@ -226,21 +274,29 @@ module.exports = async function handler(req, res) {
     } else if (text.startsWith('/consulta')) {
       const partes = text.split(/\s+/);
       if (partes.length < 2) {
-        await sendMessage(chatId, 'Debes indicar una placa. Ejemplo: /consulta ABC-123');
+        await sendMessage(chatId, '❌ Debes indicar una placa.\nEjemplo: /consulta ABC-123');
       } else {
         await handleConsulta(chatId, user, partes[1], telegramId);
       }
 
+    } else if (PLACA_REGEX.test(text.replace(/-/g, ''))) {
+      // Consulta directa escribiendo la placa sin comando
+      await handleConsulta(chatId, user, text, telegramId);
+
     } else {
-      await sendMessage(chatId, 'No entendi ese comando. Escribe /ayuda para ver las opciones.');
+      await sendMessage(chatId,
+        '❓ No entendí ese comando.\n\n' +
+        'Escribe /ayuda para ver las opciones,\n' +
+        'o simplemente escribe una placa como ABC-123.'
+      );
     }
 
   } catch (err) {
-    console.error('[Webhook] Error inesperado:', err.message);
+    console.error('[Webhook] Error inesperado:', err.message, err.stack);
     if (chatId) {
       try {
-        await sendMessage(chatId, 'Ocurrio un error interno. Por favor intenta nuevamente en unos segundos.');
-      } catch (_) { /* silencioso */ }
+        await sendMessage(chatId, '⚠️ Ocurrió un error interno. Por favor intenta nuevamente.');
+      } catch (_) {}
     }
   }
 
