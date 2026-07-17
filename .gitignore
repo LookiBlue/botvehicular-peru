@@ -1,0 +1,17 @@
+# Variables de entorno locales — NO subir a GitHub
+.env
+.env.local
+
+# Dependencias de Node.js
+node_modules/
+
+# Carpeta de Vercel
+.vercel/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Sistema operativo
+.DS_Store
+Thumbs.db

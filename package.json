@@ -1,0 +1,20 @@
+{
+  "name": "botvehicular-peru",
+  "version": "1.0.0",
+  "description": "Bot de Telegram para consulta de placas vehiculares peruanas",
+  "main": "api/webhook.js",
+  "scripts": {
+    "dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "axios": "^1.7.2"
+  },
+  "devDependencies": {
+    "vercel": "^34.0.0"
+  },
+  "engines": {
+    "node": ">=18.x"
+  }
+}
