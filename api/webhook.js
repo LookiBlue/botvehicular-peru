@@ -251,24 +251,32 @@ module.exports = async function handler(req, res) {
   // Verificar el token secreto del webhook (seguridad)
   const webhookSecret = req.headers['x-telegram-bot-api-secret-token'];
   if (process.env.WEBHOOK_SECRET && webhookSecret !== process.env.WEBHOOK_SECRET) {
+    console.error('[Webhook] Token secreto inválido:', webhookSecret);
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  // Responder a Telegram de inmediato para evitar re-envíos
-  res.status(200).json({ ok: true });
-
+  // ── IMPORTANTE: Procesar ANTES de responder ──────────────────────────────
+  // En Vercel Serverless, res.json() termina la ejecución de la función.
+  // Todo el procesamiento async debe completarse ANTES de enviar el 200.
   try {
     const update = req.body;
+    console.log('[Webhook] Update recibido:', JSON.stringify(update).slice(0, 200));
+
     const message = update?.message;
 
-    if (!message || !message.text) return;
+    if (!message || !message.text) {
+      return res.status(200).json({ ok: true });
+    }
 
     const chatId     = message.chat.id;
     const telegramId = message.from.id;
     const text       = message.text.trim();
 
+    console.log(`[Webhook] Mensaje de ${telegramId}: ${text}`);
+
     // Registrar o recuperar usuario
     const user = await getOrCreateUser(telegramId, message.from.username);
+    console.log('[Webhook] Usuario:', user);
 
     // ── Router de comandos ──────────────────────────────────────────────
     if (text === '/start' || text.startsWith('/start ')) {
@@ -289,12 +297,15 @@ module.exports = async function handler(req, res) {
       }
 
     } else {
-      // Si el usuario escribe algo sin comando, sugerir ayuda
       await sendMessage(chatId,
         `No entendí ese comando. Escribe /ayuda para ver las opciones disponibles.`
       );
     }
   } catch (err) {
-    console.error('[Webhook] Error inesperado:', err);
+    console.error('[Webhook] Error inesperado:', err.message, err.stack);
+    // No relanzar el error — siempre responder 200 a Telegram para evitar reintentos
   }
+
+  // Responder 200 al FINAL, después de procesar todo
+  return res.status(200).json({ ok: true });
 };
