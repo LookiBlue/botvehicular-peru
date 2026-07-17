@@ -1,19 +1,21 @@
 // api/webhook.js
-// Función principal de Vercel — Recibe todos los updates de Telegram
-// Endpoint: POST /api/webhook
+// Bot Vehicular Perú — Webhook principal Vercel
+// Consulta 5 fuentes: SAT Lima, APESEG, MTC, SUNARP, SUTRAN
 
 const { sendMessage, sendTyping } = require('../lib/telegram');
 const { getOrCreateUser, deductCredit, getCachedVehicle, saveVehicleCache } = require('../lib/supabase');
 const { consultarSAT }    = require('../lib/scrapers/sat');
 const { consultarAPESEG } = require('../lib/scrapers/apeseg');
 const { consultarMTC }    = require('../lib/scrapers/mtc');
+const { consultarSUNARP } = require('../lib/scrapers/sunarp');
+const { consultarSUTRAN } = require('../lib/scrapers/sutran');
 const { calcularScore }   = require('../lib/score');
 
 // Regex para detectar placa peruana válida en texto libre
 const PLACA_REGEX = /^[A-Za-z]{3}[-]?\d{3}$|^[A-Za-z]{2}[-]?\d{4}$/;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FORMATEADOR DEL REPORTE
+// FORMATEADOR DEL REPORTE COMPLETO
 // ─────────────────────────────────────────────────────────────────────────────
 
 function clasificarNivel(score) {
@@ -23,7 +25,7 @@ function clasificarNivel(score) {
   return { emoji: '🔴', texto: 'MUY ALTO RIESGO' };
 }
 
-function formatearReporte(placa, sat, apeseg, mtc, scoreData, creditosRestantes) {
+function formatearReporte(placa, sat, apeseg, mtc, sunarp, sutran, scoreData, creditosRestantes) {
   const fecha = new Date().toLocaleDateString('es-PE', {
     day: '2-digit', month: '2-digit', year: 'numeric',
     hour: '2-digit', minute: '2-digit',
@@ -32,96 +34,141 @@ function formatearReporte(placa, sat, apeseg, mtc, scoreData, creditosRestantes)
 
   const nivel  = scoreData.nivel;
   const llenas = Math.round(scoreData.score / 10);
-  const vacias = 10 - llenas;
-  const barra  = '🟩'.repeat(llenas) + '⬜'.repeat(vacias);
+  const barra  = '🟩'.repeat(llenas) + '⬜'.repeat(10 - llenas);
 
-  // ── Sección SAT ─────────────────────────────────────────────────────────
-  let satText;
+  // ── SUNARP — Datos del Vehículo ──────────────────────────────────────────
+  let vehiculoSection;
+  if (sunarp?.error || !sunarp) {
+    vehiculoSection = '⚠️ No disponible';
+  } else {
+    const lineas = [];
+    if (sunarp.propietario && sunarp.propietario !== 'No disponible') lineas.push(`👤 Propietario: ${sunarp.propietario}`);
+    if (sunarp.num_titulares) lineas.push(`🔄 Dueños anteriores: ${sunarp.num_titulares}`);
+    if (sunarp.marca !== 'No disponible') lineas.push(`🚗 ${[sunarp.marca, sunarp.modelo].filter(Boolean).join(' ')}`);
+    if (sunarp.ano_fabricacion !== 'No disponible') lineas.push(`📅 Año: ${sunarp.ano_fabricacion}`);
+    if (sunarp.color !== 'No disponible') lineas.push(`🎨 Color: ${sunarp.color}`);
+    if (sunarp.clase !== 'No disponible') lineas.push(`📋 Clase: ${sunarp.clase}`);
+    if (sunarp.motor !== 'No disponible') lineas.push(`⚙️ Motor: ${sunarp.motor}`);
+    lineas.push(sunarp.tiene_gravamen ? '🔒 Tiene GRAVAMEN/PRENDA activa' : '✅ Sin gravámenes');
+    lineas.push(sunarp.tiene_embargo ? '⛔ Tiene EMBARGO activo' : '✅ Sin embargos');
+    if (sunarp.estado !== 'No disponible') lineas.push(`📌 Estado: ${sunarp.estado}`);
+    vehiculoSection = lineas.length > 0 ? lineas.join('\n   ') : '⚠️ Sin datos disponibles';
+  }
+
+  // ── SAT Lima — Multas Administrativas ────────────────────────────────────
+  let satSection;
   if (sat?.error) {
-    satText = '⚠️ Servicio no disponible';
+    satSection = '⚠️ No disponible';
   } else if (sat.multas_impagas > 0) {
-    satText = `🚨 ${sat.multas_impagas} multa(s) — Deuda: S/. ${Number(sat.deuda_total).toFixed(2)}`;
+    satSection = `🚨 ${sat.multas_impagas} multa(s) impaga(s)\n   💰 Deuda total: S/. ${Number(sat.deuda_total).toFixed(2)}`;
     if (sat.detalle_multas?.length > 0) {
       sat.detalle_multas.slice(0, 3).forEach(m => {
-        satText += `\n     • ${m.descripcion || m.numero} S/. ${m.monto}`;
+        satSection += `\n   • ${m.descripcion || m.numero} — S/. ${m.monto}`;
       });
     }
   } else {
-    satText = '✅ Sin multas pendientes';
+    satSection = '✅ Sin multas en Lima';
   }
 
-  // ── Sección APESEG ───────────────────────────────────────────────────────
-  let apesegText;
+  // ── SUTRAN — Infracciones Nacionales ─────────────────────────────────────
+  let sutranSection;
+  if (sutran?.error || !sutran) {
+    sutranSection = '⚠️ No disponible';
+  } else if (sutran.infracciones > 0) {
+    sutranSection = `🚨 ${sutran.infracciones} infracción(es) nacional(es)\n   💰 Monto: S/. ${Number(sutran.monto_total).toFixed(2)}`;
+    if (sutran.detalle?.length > 0) {
+      sutran.detalle.slice(0, 2).forEach(d => {
+        sutranSection += `\n   • ${d.descripcion || 'Infracción'} — ${d.fecha}`;
+      });
+    }
+  } else {
+    sutranSection = '✅ Sin infracciones nacionales (SUTRAN)';
+  }
+
+  // ── APESEG — SOAT ────────────────────────────────────────────────────────
+  let apesegSection;
   if (apeseg?.error || apeseg?.soat_vigente === null) {
-    apesegText = '⚠️ Servicio no disponible';
+    apesegSection = '⚠️ No disponible';
   } else if (apeseg.soat_vigente) {
     const vence = apeseg.fecha_vencimiento
       ? new Date(apeseg.fecha_vencimiento).toLocaleDateString('es-PE', { day: '2-digit', month: '2-digit', year: 'numeric' })
       : 'N/D';
-    apesegText = `✅ SOAT Vigente\n     Aseguradora: ${apeseg.aseguradora}\n     Vence: ${vence}`;
+    apesegSection = `✅ SOAT Vigente\n   Aseguradora: ${apeseg.aseguradora}\n   Vence: ${vence}`;
   } else {
-    apesegText = '❌ Sin SOAT vigente';
+    apesegSection = '❌ Sin SOAT vigente';
   }
 
-  // ── Sección MTC ──────────────────────────────────────────────────────────
-  let mtcText;
+  // ── MTC — Papeletas y Revisión Técnica ───────────────────────────────────
+  let mtcSection;
   if (mtc?.error) {
-    mtcText = '⚠️ Servicio no disponible';
+    mtcSection = '⚠️ No disponible';
   } else {
     const lineas = [];
-    if (mtc.propietario && mtc.propietario !== 'No disponible') lineas.push(`👤 ${mtc.propietario}`);
-    if (mtc.marca && mtc.marca !== 'No disponible') {
-      lineas.push(`🚗 ${[mtc.marca, mtc.modelo, mtc.ano].filter(x => x && x !== 'No disponible').join(' ')}`);
-    }
-    if (mtc.color && mtc.color !== 'No disponible') lineas.push(`🎨 ${mtc.color}`);
     lineas.push(mtc.reportado_robado ? '🚨 REPORTADO COMO ROBADO' : '✅ Sin reporte de robo');
     lineas.push(mtc.revision_tecnica_vencida ? '❌ Revisión técnica VENCIDA' : '✅ Revisión técnica vigente');
     if (mtc.papeletas_pendientes > 0) lineas.push(`🚨 ${mtc.papeletas_pendientes} papeleta(s) pendiente(s)`);
-    mtcText = lineas.join('\n     ');
+    mtcSection = lineas.join('\n   ');
   }
 
-  // ── Penalizaciones ────────────────────────────────────────────────────────
-  const penActivas = scoreData.penalizaciones.filter(p => p.puntos < 0);
-  const penText = penActivas.length > 0
-    ? '\n⚠️ Penalizaciones:\n' + penActivas.map(p => `   ${p.motivo} (${p.puntos} pts)`).join('\n') + '\n'
+  // ── Penalizaciones del Score ──────────────────────────────────────────────
+  const penActivas = scoreData.penalizaciones?.filter(p => p.puntos < 0) || [];
+  const penSection = penActivas.length > 0
+    ? penActivas.map(p => `   ⚠️ ${p.motivo} (${p.puntos} pts)`).join('\n') + '\n'
     : '';
 
-  return `🚗 REPORTE VEHICULAR — Placa: ${placa.toUpperCase()}
-━━━━━━━━━━━━━━━━━━━━━━━
+  return `🚗 REPORTE VEHICULAR PERU
+Placa: ${placa.toUpperCase()}
+━━━━━━━━━━━━━━━━━━━━━━━━
 🎯 Score de Riesgo: ${scoreData.score}/100 ${nivel.emoji} ${nivel.texto}
 ${barra}
-${penText}
-━━━━━━━━━━━━━━━━━━━━━━━
-🏛️ SAT LIMA (Multas Adm.)
-   ${satText}
+${penSection}
+🏛️ DATOS DEL VEHICULO (SUNARP)
+   ${vehiculoSection}
 
-🛡️ APESEG (SOAT)
-   ${apesegText}
+🏙️ SAT LIMA (Multas Municipales)
+   ${satSection}
 
-📋 MTC / SUNARP
-   ${mtcText}
-━━━━━━━━━━━━━━━━━━━━━━━
-🕐 ${fecha} (Lima)
-💳 Créditos restantes: ${creditosRestantes}`;
+🛣️ SUTRAN (Infracciones Nacionales)
+   ${sutranSection}
+
+🛡️ SOAT — APESEG
+   ${apesegSection}
+
+📋 MTC (Papeletas / Robo / Tec.)
+   ${mtcSection}
+━━━━━━━━━━━━━━━━━━━━━━━━
+📅 ${fecha} (Lima)
+💳 Créditos restantes: ${creditosRestantes}
+
+💡 Para compra/venta de autos usa /ayuda`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MANEJADORES DE COMANDOS
+// HANDLER DE CONSULTA
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function handleStart(chatId, user, telegramUser) {
   const nombre = telegramUser.first_name || 'amigo';
   await sendMessage(chatId,
     `🚗 Bienvenido al Bot Vehicular Perú, ${nombre}!\n\n` +
-    `Tienes ${user.credits} consultas gratuitas para comenzar.\n\n` +
-    `¿Cómo consultar?\n` +
+    `Tienes ${user.credits} consultas gratuitas.\n\n` +
+    `Como consultar:\n` +
     `/consulta ABC-123\n` +
-    `O simplemente escribe la placa: ABC123\n\n` +
-    `Comandos disponibles:\n` +
-    `/consulta [PLACA] — Consultar un vehículo\n` +
-    `/creditos — Ver tus créditos\n` +
-    `/ayuda — Instrucciones\n\n` +
-    `El reporte incluye: SAT Lima, SOAT, MTC/SUNARP y Score de Riesgo 🎯`
+    `O escribe la placa directamente: ABC123\n\n` +
+    `El informe incluye:\n` +
+    `🏛️ Datos del vehículo (SUNARP)\n` +
+    `👤 Propietario y nro. de dueños\n` +
+    `🔒 Gravámenes y embargos\n` +
+    `🏙️ Multas SAT Lima\n` +
+    `🛣️ Infracciones SUTRAN (nacional)\n` +
+    `🛡️ SOAT vigente (APESEG)\n` +
+    `🚨 Reporte de robo (PNP/MTC)\n` +
+    `🔧 Revisión técnica\n` +
+    `🎯 Score de Riesgo Vehicular\n\n` +
+    `Comandos:\n` +
+    `/consulta [PLACA]\n` +
+    `/creditos\n` +
+    `/ayuda`
   );
 }
 
@@ -129,31 +176,33 @@ async function handleCreditos(chatId, user) {
   await sendMessage(chatId,
     `💳 Tus Créditos\n\n` +
     `Tienes ${user.credits} consulta(s) disponible(s).\n` +
-    `Cada consulta de placa consume 1 crédito.\n` +
-    `Los resultados se guardan en caché 24 horas.`
+    `Cada consulta consume 1 crédito.\n` +
+    `Los resultados se guardan 24h en caché.`
   );
 }
 
 async function handleAyuda(chatId) {
   await sendMessage(chatId,
     `📖 Ayuda — Bot Vehicular Perú\n\n` +
-    `Cómo hacer una consulta:\n` +
+    `COMO USAR:\n` +
     `/consulta ABC-123\n` +
-    `/consulta ABC123\n` +
-    `O escribe la placa directamente.\n\n` +
-    `Qué datos obtienes:\n` +
-    `🏛️ Multas administrativas (SAT Lima)\n` +
+    `O simplemente escribe la placa.\n\n` +
+    `QUE INCLUYE EL REPORTE:\n` +
+    `🏛️ Datos SUNARP: propietario, nro de dueños anteriores, marca, modelo, año, color, motor, serie\n` +
+    `🔒 Gravámenes y embargos activos\n` +
+    `🏙️ Multas SAT Lima (municipales)\n` +
+    `🛣️ Infracciones SUTRAN a nivel nacional\n` +
     `🛡️ Estado del SOAT (APESEG)\n` +
-    `📋 Papeletas de tránsito (MTC)\n` +
-    `🚨 Reporte de robo (SUNARP/PNP)\n` +
-    `🔧 Revisión técnica (MTC)\n` +
-    `🎯 Score de Riesgo Vehicular (0-100)\n\n` +
-    `Interpretación del Score:\n` +
+    `🚨 Reporte de robo (PNP)\n` +
+    `🔧 Revisión técnica vehicular\n` +
+    `🎯 Score de Riesgo (0-100)\n\n` +
+    `PARA COMPRA DE VEHICULOS:\n` +
+    `Verifica que no tenga gravámenes, embargos, multas ni robo reportado antes de comprar.\n\n` +
+    `SCORE DE RIESGO:\n` +
     `🟢 80-100: Bajo Riesgo\n` +
     `🟡 55-79: Riesgo Moderado\n` +
     `🟠 30-54: Alto Riesgo\n` +
-    `🔴 0-29: Muy Alto Riesgo\n\n` +
-    `Los resultados se guardan 24h en caché.`
+    `🔴 0-29: Muy Alto Riesgo`
   );
 }
 
@@ -162,14 +211,14 @@ async function handleConsulta(chatId, user, placaRaw, telegramId) {
 
   if (!/^[A-Z]{3}\d{3}$/.test(placa) && !/^[A-Z]{2}\d{4}$/.test(placa)) {
     return sendMessage(chatId,
-      '❌ Formato de placa inválido.\n\n' +
-      'Ejemplos válidos:\n' +
+      '❌ Formato de placa invalido.\n\n' +
+      'Ejemplos validos:\n' +
       '/consulta ABC-123\n' +
       '/consulta AB1234'
     );
   }
 
-  // Verificar caché primero
+  // Verificar caché
   try {
     const cached = await getCachedVehicle(placa);
     if (cached) {
@@ -179,17 +228,17 @@ async function handleConsulta(chatId, user, placaRaw, telegramId) {
           cached.data_json.sat,
           cached.data_json.apeseg,
           cached.data_json.mtc,
+          cached.data_json.sunarp,
+          cached.data_json.sutran,
           { score: cached.score, nivel: clasificarNivel(cached.score), penalizaciones: cached.data_json.penalizaciones || [] },
           user.credits
-        ) + '\n\n📦 Resultado desde caché (menos de 24h)'
+        ) + '\n\n📦 Desde cache (menos de 24h)'
       );
     }
-  } catch (_) { /* continuar si falla el caché */ }
+  } catch (_) {}
 
   if (user.credits <= 0) {
-    return sendMessage(chatId,
-      '❌ Sin créditos disponibles.\n\nActualmente no tienes consultas disponibles.'
-    );
+    return sendMessage(chatId, '❌ Sin creditos disponibles.');
   }
 
   // Notificar que está procesando
@@ -197,43 +246,46 @@ async function handleConsulta(chatId, user, placaRaw, telegramId) {
   await sendMessage(chatId,
     `🔍 Consultando ${placa}...\n\n` +
     `Accediendo a:\n` +
-    `• 🏛️ SAT Lima\n` +
-    `• 🛡️ APESEG\n` +
-    `• 📋 MTC / SUNARP\n\n` +
+    `🏛️ SUNARP (propietario/datos)\n` +
+    `🏙️ SAT Lima (multas)\n` +
+    `🛣️ SUTRAN (infracciones nac.)\n` +
+    `🛡️ APESEG (SOAT)\n` +
+    `📋 MTC (papeletas/robo)\n\n` +
     `Esto toma unos segundos...`
   );
 
-  // Consultar las 3 fuentes en paralelo
-  const [sat, apeseg, mtc] = await Promise.all([
+  // Consultar las 5 fuentes en paralelo
+  const [sat, apeseg, mtc, sunarp, sutran] = await Promise.all([
     consultarSAT(placa),
     consultarAPESEG(placa),
     consultarMTC(placa),
+    consultarSUNARP(placa),
+    consultarSUTRAN(placa),
   ]);
 
   const scoreData = calcularScore(sat, apeseg, mtc);
 
-  // Descontar crédito y guardar en caché
+  // Descontar crédito y guardar caché
   try { await deductCredit(telegramId); } catch (_) {}
   const creditosRestantes = Math.max(0, user.credits - 1);
+  try {
+    await saveVehicleCache(placa, { sat, apeseg, mtc, sunarp, sutran, penalizaciones: scoreData.penalizaciones }, scoreData.score);
+  } catch (_) {}
 
-  try { await saveVehicleCache(placa, { sat, apeseg, mtc, penalizaciones: scoreData.penalizaciones }, scoreData.score); } catch (_) {}
-
-  await sendMessage(chatId, formatearReporte(placa, sat, apeseg, mtc, scoreData, creditosRestantes));
+  await sendMessage(chatId, formatearReporte(placa, sat, apeseg, mtc, sunarp, sutran, scoreData, creditosRestantes));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HANDLER PRINCIPAL DE VERCEL
+// HANDLER PRINCIPAL VERCEL
 // ─────────────────────────────────────────────────────────────────────────────
 
 module.exports = async function handler(req, res) {
   if (req.method !== 'POST') {
-    return res.status(200).json({ ok: true, info: 'Bot Vehicular Peru activo' });
+    return res.status(200).json({ ok: true, info: 'Bot Vehicular Peru activo v2' });
   }
 
-  // Verificar token secreto del webhook
   const webhookSecret = req.headers['x-telegram-bot-api-secret-token'];
   if (process.env.WEBHOOK_SECRET && webhookSecret !== process.env.WEBHOOK_SECRET) {
-    console.error('[Webhook] Token secreto inválido recibido');
     return res.status(200).json({ ok: true });
   }
 
@@ -242,35 +294,24 @@ module.exports = async function handler(req, res) {
   try {
     const update = req.body;
     const message = update?.message;
-
-    if (!message || !message.text) {
-      return res.status(200).json({ ok: true });
-    }
+    if (!message || !message.text) return res.status(200).json({ ok: true });
 
     chatId           = message.chat.id;
     const telegramId = message.from.id;
     const text       = message.text.trim();
 
-    console.log(`[Webhook] Msg de ${telegramId}: ${text}`);
+    console.log(`[Webhook] ${telegramId}: ${text}`);
 
-    // Obtener usuario con fallback si Supabase falla
     let user = { credits: 5, telegram_id: telegramId };
-    try {
-      user = await getOrCreateUser(telegramId, message.from.username);
-    } catch (dbErr) {
-      console.error('[Supabase] Error al obtener usuario:', dbErr.message);
-    }
+    try { user = await getOrCreateUser(telegramId, message.from.username); } catch (_) {}
 
-    // Router de comandos
+    // Router
     if (text === '/start' || text.startsWith('/start ')) {
       await handleStart(chatId, user, message.from);
-
     } else if (text === '/creditos') {
       await handleCreditos(chatId, user);
-
     } else if (text === '/ayuda' || text === '/help') {
       await handleAyuda(chatId);
-
     } else if (text.startsWith('/consulta')) {
       const partes = text.split(/\s+/);
       if (partes.length < 2) {
@@ -278,25 +319,19 @@ module.exports = async function handler(req, res) {
       } else {
         await handleConsulta(chatId, user, partes[1], telegramId);
       }
-
     } else if (PLACA_REGEX.test(text.replace(/-/g, ''))) {
-      // Consulta directa escribiendo la placa sin comando
+      // Consulta directa sin comando
       await handleConsulta(chatId, user, text, telegramId);
-
     } else {
       await sendMessage(chatId,
-        '❓ No entendí ese comando.\n\n' +
-        'Escribe /ayuda para ver las opciones,\n' +
-        'o simplemente escribe una placa como ABC-123.'
+        '❓ No entendi ese comando.\nEscribe /ayuda o simplemente la placa: ABC-123'
       );
     }
 
   } catch (err) {
-    console.error('[Webhook] Error inesperado:', err.message, err.stack);
+    console.error('[Webhook] Error:', err.message, err.stack);
     if (chatId) {
-      try {
-        await sendMessage(chatId, '⚠️ Ocurrió un error interno. Por favor intenta nuevamente.');
-      } catch (_) {}
+      try { await sendMessage(chatId, '⚠️ Error interno. Intenta nuevamente.'); } catch (_) {}
     }
   }
 
